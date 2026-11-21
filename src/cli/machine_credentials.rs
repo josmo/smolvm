@@ -69,9 +69,7 @@ impl AddCmd {
         let name = self.name.unwrap_or_else(|| "default".to_string());
         let record = smolvm::db::SmolvmDb::open()?
             .get_vm(&name)?
-            .ok_or_else(|| {
-                smolvm::Error::config("credentials", format!("machine '{name}' not found"))
-            })?;
+            .ok_or_else(|| smolvm::Error::vm_not_found(&name))?;
         let mut policy = record.credential_policy.clone().unwrap_or_default();
         let mut added = Vec::new();
         for spec in &self.credentials {
@@ -99,9 +97,7 @@ impl RemoveCmd {
         let name = self.name.unwrap_or_else(|| "default".to_string());
         let record = smolvm::db::SmolvmDb::open()?
             .get_vm(&name)?
-            .ok_or_else(|| {
-                smolvm::Error::config("credentials", format!("machine '{name}' not found"))
-            })?;
+            .ok_or_else(|| smolvm::Error::vm_not_found(&name))?;
         let mut policy = record.credential_policy.clone().unwrap_or_default();
         if let Some(unknown) = self
             .bindings
@@ -182,9 +178,7 @@ impl RefreshCmd {
         let name = self.name.unwrap_or_else(|| "default".to_string());
         let record = smolvm::db::SmolvmDb::open()?
             .get_vm(&name)?
-            .ok_or_else(|| {
-                smolvm::Error::config("credentials", format!("machine '{name}' not found"))
-            })?;
+            .ok_or_else(|| smolvm::Error::vm_not_found(&name))?;
         if record.credentials_supplied_by_api {
             return Err(smolvm::Error::config(
                 "credentials",
