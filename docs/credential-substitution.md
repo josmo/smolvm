@@ -407,3 +407,11 @@ machine launch to associate connections with its policy. The service owns
 TLS handling and credential resolution; the caller installs its CA and
 placeholder environment variables in the guest. No `HTTPS_PROXY` setting is
 needed.
+
+A service built on the `smolvm-credentials` crate, or a program embedding it,
+can also refuse requests: `InterceptorConfig::request_filter` is asked about
+every request on a terminated host and can answer `403`, and
+`InterceptorConfig::terminate_hosts` terminates hosts no binding covers so the
+filter sees them too. Those hosts also take request bodies over 8 MiB and
+WebSockets, which credential hosts refuse. smolvm itself sets neither; the
+crate's documentation has the details.
