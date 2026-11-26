@@ -1397,6 +1397,8 @@ impl CredentialLaunch {
                 ca,
                 extra_cas: load_extra_cas(&self.ca_dir, &self.ca_owner),
                 upstream_roots_pem: Vec::new(),
+                terminate_hosts: Vec::new(),
+                request_filter: None,
             },
             Arc::new(SecretRefResolver {
                 sources: sources.clone(),
@@ -2791,6 +2793,8 @@ mod tests {
                     ca: MachineCa::generate("live-test", &binding_subtrees(policy)).unwrap(),
                     extra_cas: Vec::new(),
                     upstream_roots_pem: Vec::new(),
+                    terminate_hosts: Vec::new(),
+                    request_filter: None,
                 },
                 Arc::new(SecretRefResolver {
                     sources: sources.clone(),
