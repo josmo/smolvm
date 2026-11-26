@@ -11,6 +11,10 @@
 //!    connection to the destination IP the guest chose;
 //! 4. otherwise splices the raw bytes to the destination untouched.
 //!
+//! An embedder may also terminate hosts no binding covers
+//! ([`InterceptorConfig::terminate_hosts`]) and refuse requests on terminated
+//! hosts ([`RequestFilter`]).
+//!
 //! Bindings change while the machine runs ([`InterceptorControl`]). A host a
 //! binding stops covering stays intercepted, nothing injected, for as long as
 //! the interceptor runs, and its responses are still scrubbed of the values
@@ -99,6 +103,36 @@ pub struct InterceptorConfig {
     /// Extra PEM roots trusted for upstream connections, for private services.
     /// Public roots stay enabled.
     pub upstream_roots_pem: Vec<Vec<u8>>,
+    /// Host patterns terminated even when no binding covers them, matched like a binding's allowed hosts, so that
+    /// `request_filter` sees their requests. Fixed for the interceptor's lifetime. A host no CA passed in permits
+    /// fails the guest's TLS handshake. On such a host a request with no placeholder in its headers has its body
+    /// streamed upstream uncapped, and a WebSocket upgrade, once the filter allows its handshake, is relayed as raw
+    /// bytes.
+    pub terminate_hosts: Vec<String>,
+    /// Asked about every request on a terminated host; `None` allows every request.
+    pub request_filter: Option<Arc<dyn RequestFilter>>,
+}
+
+/// Asked about every request on a host the interceptor terminates, before any credential work. Requests the
+/// interceptor refuses anyway (absolute-form, `CONNECT`, a `Host` that differs from the TLS server name, an upgrade
+/// other than WebSocket) are refused before it is asked. Frames after a WebSocket handshake are not.
+pub trait RequestFilter: Send + Sync {
+    /// `Err(reason)` refuses the request with 403 and that reason. Called on the interceptor's runtime: it must
+    /// not block.
+    fn check(&self, request: &RequestInfo<'_>) -> Result<(), String>;
+}
+
+/// A request on a terminated host, as [`RequestFilter::check`] sees it.
+#[non_exhaustive]
+pub struct RequestInfo<'a> {
+    /// The TLS server name, which the `Host` header matches.
+    pub host: &'a str,
+    pub port: u16,
+    pub method: &'a str,
+    /// Path and query as sent upstream: dot segments and `\` resolved, as a URL parser does. Encoded slashes
+    /// (`%2f`) and `;` parameters are passed as sent; the origin server may treat them differently.
+    pub target: &'a str,
+    pub headers: &'a header::HeaderMap,
 }
 
 /// A running interceptor. Dropping it stops the listener and every session.
@@ -252,6 +286,8 @@ struct State {
     clients: Mutex<HashMap<(String, SocketAddr), reqwest::Client>>,
     upstream_roots: Vec<reqwest::Certificate>,
     sessions: Arc<tokio::sync::Semaphore>,
+    terminate_hosts: Vec<String>,
+    request_filter: Option<Arc<dyn RequestFilter>>,
 }
 
 impl Interceptor {
@@ -270,7 +306,7 @@ impl Interceptor {
             .iter()
             .map(|pem| reqwest::Certificate::from_pem(pem).context("upstream root"))
             .collect::<Result<Vec<_>>>()?;
-        let cas = std::iter::once(config.ca)
+        let cas: Vec<Arc<MachineCa>> = std::iter::once(config.ca)
             .chain(config.extra_cas)
             .map(Arc::new)
             .collect();
@@ -297,6 +333,8 @@ impl Interceptor {
             clients: Mutex::new(HashMap::new()),
             upstream_roots,
             sessions: Arc::new(tokio::sync::Semaphore::new(MAX_SESSIONS)),
+            terminate_hosts: config.terminate_hosts,
+            request_filter: config.request_filter,
         });
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -694,6 +732,7 @@ async fn terminate(
     http1::Builder::new()
         .keep_alive(true)
         .serve_connection(TokioIo::new(tls), service)
+        .with_upgrades()
         .await
         .context("serve intercepted connection")?;
     Ok(())
@@ -740,13 +779,18 @@ impl State {
         }
     }
 
-    /// Whether flows to `host` are intercepted rather than spliced: a binding covers it, or one did.
+    /// Whether flows to `host` are intercepted rather than spliced: a binding covers it, or one did, or it is a
+    /// terminate host.
     fn intercepts(&self, host: &str) -> bool {
-        self.bindings()
-            .policy
-            .bindings_for_host(host)
-            .next()
-            .is_some()
+        self.terminate_hosts
+            .iter()
+            .any(|pattern| smolvm_protocol::credentials::host_matches(pattern, host))
+            || self
+                .bindings()
+                .policy
+                .bindings_for_host(host)
+                .next()
+                .is_some()
             || self.retired.lock().expect("retired values").covers(host)
     }
 
@@ -985,6 +1029,8 @@ impl State {
             return Ok(client.clone());
         }
         let mut builder = reqwest::Client::builder()
+            // A WebSocket upgrade needs HTTP/1.1 upstream: never offer h2, whatever reqwest's features.
+            .http1_only()
             .use_rustls_tls()
             .no_proxy()
             .https_only(true)
@@ -1046,27 +1092,44 @@ impl State {
             ));
         }
 
-        // WebSocket tunneling cannot use the HTTP forwarding client. Tell
-        // clients with an HTTP fallback to retry that transport; never forward
-        // the handshake or substitute its credential into an unsupported flow.
-        if websocket_upgrade {
-            let mut reply = text(
-                StatusCode::UPGRADE_REQUIRED,
-                "smolvm credentials: WebSocket forwarding is unavailable; use HTTP/1.1",
-            );
-            reply.headers_mut().insert(
-                header::UPGRADE,
-                header::HeaderValue::from_static("HTTP/1.1"),
-            );
-            return Ok(reply);
+        // A WebSocket to a host a binding covers, or did, could carry a credential unchecked: whatever else the request
+        // says, tell clients with an HTTP fallback to retry that transport.
+        let credential_host = live.policy.bindings_for_host(host).next().is_some()
+            || self.retired.lock().expect("retired values").covers(host);
+        if websocket_upgrade && credential_host {
+            return Ok(websocket_unavailable());
         }
 
-        let (parts, body) = request.into_parts();
+        let (mut parts, body) = request.into_parts();
         let target = parts
             .uri
             .path_and_query()
             .map(|p| p.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
+        // Parsed once, here: the URL normalizes dot segments (`/a/../b`, `%2e%2e`), and the filter must judge the
+        // path the upstream request carries, not the raw one.
+        let Ok(url) = reqwest::Url::parse(&format!("https://{authority}{target}")) else {
+            return Ok(text(
+                StatusCode::BAD_REQUEST,
+                "smolvm credentials: invalid request target",
+            ));
+        };
+        if let Some(filter) = &self.request_filter {
+            let path = match url.query() {
+                Some(query) => format!("{}?{query}", url.path()),
+                None => url.path().to_string(),
+            };
+            let info = RequestInfo {
+                host,
+                port: destination.port(),
+                method: parts.method.as_str(),
+                target: &path,
+                headers: &parts.headers,
+            };
+            if let Err(reason) = filter.check(&info) {
+                return Ok(text(StatusCode::FORBIDDEN, reason));
+            }
+        }
         if target.contains(PLACEHOLDER_PREFIX) {
             return Ok(text(
                 StatusCode::FORBIDDEN,
@@ -1078,13 +1141,23 @@ impl State {
             Ok(found) => found,
             Err(reason) => return Ok(text(StatusCode::FORBIDDEN, reason)),
         };
-        let body = match Limited::new(body, REQUEST_LIMIT).collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(_) => {
-                return Ok(text(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "smolvm credentials: request body exceeds 8 MiB",
-                ))
+        // A host no binding covers, or ever did, has nothing to substitute or scrub when the headers carry no
+        // placeholder: its body is sent as it arrives, uncapped, and a WebSocket upgrade is relayed.
+        let passthrough = substitution.is_none() && !credential_host;
+        if websocket_upgrade && !passthrough {
+            return Ok(websocket_unavailable());
+        }
+        let (body, streamed) = if passthrough {
+            (Bytes::new(), Some(body))
+        } else {
+            match Limited::new(body, REQUEST_LIMIT).collect().await {
+                Ok(collected) => (collected.to_bytes(), None),
+                Err(_) => {
+                    return Ok(text(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "smolvm credentials: request body exceeds 8 MiB",
+                    ))
+                }
             }
         };
         let body_placeholder = match find_body_placeholder(&body) {
@@ -1246,8 +1319,20 @@ impl State {
         }
 
         strip_hop_headers(&mut headers);
+        if websocket_upgrade {
+            headers.insert(
+                header::CONNECTION,
+                header::HeaderValue::from_static("upgrade"),
+            );
+            headers.insert(
+                header::UPGRADE,
+                header::HeaderValue::from_static("websocket"),
+            );
+        }
         headers.remove(header::HOST);
-        headers.remove(header::CONTENT_LENGTH);
+        if streamed.is_none() {
+            headers.remove(header::CONTENT_LENGTH);
+        }
         // The response is checked for credential values, which needs it whole
         // and readable: a partial range could carry a value in pieces too
         // short to match, and a compressed body hides it.
@@ -1261,11 +1346,38 @@ impl State {
 
         let client = self.client_for(host, destination)?;
         let upstream = client
-            .request(parts.method, format!("https://{authority}{target}"))
+            .request(parts.method, url)
             .headers(headers)
-            .body(body)
+            .body(match streamed {
+                Some(incoming) => reqwest::Body::wrap(incoming),
+                None => body.into(),
+            })
             .send()
             .await?;
+
+        if websocket_upgrade && upstream.status() == StatusCode::SWITCHING_PROTOCOLS {
+            let guest = parts
+                .extensions
+                .remove::<hyper::upgrade::OnUpgrade>()
+                .context("guest connection cannot upgrade")?;
+            // The connection's task, and its session, end with the upgrade: the relay holds one of its own.
+            let Ok(session) = self.sessions.clone().try_acquire_owned() else {
+                return Ok(text(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "smolvm credentials: too many sessions",
+                ));
+            };
+            let mut reply = text(StatusCode::SWITCHING_PROTOCOLS, Bytes::new());
+            *reply.headers_mut() = upstream.headers().clone();
+            tokio::spawn(async move {
+                let _session = session;
+                if let (Ok(guest), Ok(mut upstream)) = (guest.await, upstream.upgrade().await) {
+                    let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(guest), &mut upstream)
+                        .await;
+                }
+            });
+            return Ok(reply);
+        }
 
         let status = upstream.status();
         let mut response_headers = upstream.headers().clone();
@@ -1701,9 +1813,22 @@ fn strip_hop_headers(headers: &mut header::HeaderMap) {
     headers.remove("proxy-connection");
 }
 
-fn text(status: StatusCode, message: &'static str) -> Reply {
+/// 426 with `Upgrade: HTTP/1.1`: retry without WebSocket.
+fn websocket_unavailable() -> Reply {
+    let mut reply = text(
+        StatusCode::UPGRADE_REQUIRED,
+        "smolvm credentials: WebSocket forwarding is unavailable; use HTTP/1.1",
+    );
+    reply.headers_mut().insert(
+        header::UPGRADE,
+        header::HeaderValue::from_static("HTTP/1.1"),
+    );
+    reply
+}
+
+fn text(status: StatusCode, message: impl Into<Bytes>) -> Reply {
     let mut reply = Response::new(
-        Full::new(Bytes::from_static(message.as_bytes()))
+        Full::new(message.into())
             .map_err(|never| match never {})
             .boxed(),
     );
@@ -1858,11 +1983,32 @@ mod tests {
                     let Ok(tls) = acceptor.accept(stream).await else {
                         return;
                     };
-                    let service = service_fn(move |request: Request<Incoming>| {
+                    let service = service_fn(move |mut request: Request<Incoming>| {
                         let recorded = recorded.clone();
                         let recorded_bodies = recorded_bodies.clone();
                         let held = shared.clone();
                         async move {
+                            // A WebSocket handshake: switch protocols and echo whatever follows.
+                            if request.headers().contains_key(header::UPGRADE) {
+                                let upgrade = hyper::upgrade::on(&mut request);
+                                tokio::spawn(async move {
+                                    if let Ok(io) = upgrade.await {
+                                        let (mut read, mut write) =
+                                            tokio::io::split(TokioIo::new(io));
+                                        let _ = tokio::io::copy(&mut read, &mut write).await;
+                                    }
+                                });
+                                let mut reply = text(StatusCode::SWITCHING_PROTOCOLS, "");
+                                reply.headers_mut().insert(
+                                    header::UPGRADE,
+                                    header::HeaderValue::from_static("websocket"),
+                                );
+                                reply.headers_mut().insert(
+                                    header::CONNECTION,
+                                    header::HeaderValue::from_static("upgrade"),
+                                );
+                                return Ok(reply);
+                            }
                             let get = |name: header::HeaderName| {
                                 request
                                     .headers()
@@ -2026,6 +2172,7 @@ mod tests {
                     });
                     let _ = http1::Builder::new()
                         .serve_connection(TokioIo::new(tls), service)
+                        .with_upgrades()
                         .await;
                 });
             }
@@ -2069,10 +2216,21 @@ mod tests {
         ca_subtree: &str,
         resolver: StaticResolver,
     ) -> Fixture {
+        fixture_with_hooks(policy, &[ca_subtree], resolver, Vec::new(), None).await
+    }
+
+    async fn fixture_with_hooks(
+        policy: CredentialPolicy,
+        ca_subtrees: &[&str],
+        resolver: StaticResolver,
+        terminate_hosts: Vec<String>,
+        request_filter: Option<Arc<dyn RequestFilter>>,
+    ) -> Fixture {
         let upstream = start_upstream().await;
         let placeholders = crate::policy::generate_placeholders(&policy);
         let placeholder = placeholders.values().next().cloned().unwrap_or_default();
-        let ca = MachineCa::generate("test-machine", &[ca_subtree.to_string()]).unwrap();
+        let subtrees: Vec<String> = ca_subtrees.iter().map(|s| s.to_string()).collect();
+        let ca = MachineCa::generate("test-machine", &subtrees).unwrap();
         let ca_pem = ca.certificate_pem().to_string();
         let interceptor = Interceptor::spawn(
             InterceptorConfig {
@@ -2082,6 +2240,8 @@ mod tests {
                 ca,
                 extra_cas: Vec::new(),
                 upstream_roots_pem: vec![upstream.cert_pem.clone()],
+                terminate_hosts,
+                request_filter,
             },
             Arc::new(resolver),
         )
@@ -2118,6 +2278,8 @@ mod tests {
     ) -> std::io::Result<String> {
         let mut tls = open_guest(f, trusted_pem, sni).await?;
         tls.write_all(request.as_bytes()).await?;
+        // A large write can leave its last TLS records buffered until a flush.
+        tls.flush().await?;
         let mut out = Vec::new();
         let _ = tls.read_to_end(&mut out).await;
         Ok(String::from_utf8_lossy(&out).into_owned())
@@ -3071,6 +3233,164 @@ mod tests {
         assert_eq!(seen, vec![(String::new(), "/public".to_string())]);
     }
 
+    /// Records (host, method, target) for each request; refuses everything when `refuse` is set.
+    #[derive(Default)]
+    struct RecordingFilter {
+        refuse: bool,
+        seen: Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl RequestFilter for RecordingFilter {
+        fn check(&self, request: &RequestInfo<'_>) -> Result<(), String> {
+            self.seen.lock().unwrap().push((
+                request.host.to_string(),
+                request.method.to_string(),
+                request.target.to_string(),
+            ));
+            if self.refuse {
+                Err(format!("blocked {} {}", request.method, request.target))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// The default credential binding on `CRED_HOST`, with `filter` and `terminate_hosts` set; the CA permits both.
+    async fn filtered_fixture(
+        filter: &Arc<RecordingFilter>,
+        terminate_hosts: Vec<String>,
+    ) -> Fixture {
+        let policy = CredentialPolicy {
+            credentials: vec![bound("svc", CRED_HOST)],
+        };
+        fixture_with_hooks(
+            policy,
+            &[CRED_HOST, OTHER_HOST],
+            StaticResolver::new().with("svc", "real-secret"),
+            terminate_hosts,
+            Some(filter.clone() as Arc<dyn RequestFilter>),
+        )
+        .await
+    }
+
+    /// Sends `request_line` to `OTHER_HOST`, trusting only the machine CA, which proves the flow was
+    /// terminated.
+    async fn terminated_request(f: &Fixture, request_line: &str) -> String {
+        let request =
+            format!("{request_line}\r\nHost: {OTHER_HOST}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        guest_request(f, f.ca_pem.as_bytes(), OTHER_HOST, &request)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminate_host_without_a_binding_is_intercepted_and_filtered() {
+        let filter = Arc::new(RecordingFilter::default());
+        let f = filtered_fixture(&filter, vec![OTHER_HOST.into()]).await;
+        let response = terminated_request(&f, "PUT /raw?x=1 HTTP/1.1").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(
+            filter.seen.lock().unwrap().clone(),
+            vec![(
+                OTHER_HOST.to_string(),
+                "PUT".to_string(),
+                "/raw?x=1".to_string()
+            )]
+        );
+        assert_eq!(f.upstream.seen.lock().unwrap()[0].1, "/raw");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusing_filter_answers_403_and_nothing_reaches_upstream() {
+        let filter = Arc::new(RecordingFilter {
+            refuse: true,
+            ..Default::default()
+        });
+        let f = filtered_fixture(&filter, vec![OTHER_HOST.into()]).await;
+        let response = terminated_request(&f, "POST /push HTTP/1.1").await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert_eq!(response_body(&response), "blocked POST /push", "{response}");
+        assert!(f.upstream.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_body_over_the_limit_streams_to_a_host_no_binding_covers() {
+        let filter = Arc::new(RecordingFilter::default());
+        let f = filtered_fixture(&filter, vec![OTHER_HOST.into()]).await;
+        let body = "x".repeat(REQUEST_LIMIT + 1);
+        let send = |host: &'static str| {
+            format!(
+                "PUT /upload HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let response = guest_request(&f, f.ca_pem.as_bytes(), OTHER_HOST, &send(OTHER_HOST))
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{}", &response[..80]);
+        assert_eq!(f.upstream.bodies.lock().unwrap()[0].len(), body.len());
+        // A bound host still collects the body to check it for a placeholder.
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &send(CRED_HOST))
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 413"), "{}", &response[..80]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_websocket_to_a_host_no_binding_covers_is_filtered_then_relayed() {
+        let filter = Arc::new(RecordingFilter::default());
+        let f = filtered_fixture(&filter, vec![OTHER_HOST.into()]).await;
+        let mut tls = open_guest(&f, f.ca_pem.as_bytes(), OTHER_HOST)
+            .await
+            .unwrap();
+        tls.write_all(
+            format!(
+                "GET /ws HTTP/1.1\r\nHost: {OTHER_HOST}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        tls.flush().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(tls.read_u8().await.unwrap());
+        }
+        let head = String::from_utf8_lossy(&head);
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        assert_eq!(
+            filter.seen.lock().unwrap().clone(),
+            vec![(OTHER_HOST.to_string(), "GET".to_string(), "/ws".to_string())]
+        );
+        tls.write_all(b"frame").await.unwrap();
+        tls.flush().await.unwrap();
+        let mut echoed = [0u8; 5];
+        tls.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"frame");
+        // The connection's own task ended with the upgrade: the relay holds a session of the cap.
+        let sessions = &f.interceptor.state.sessions;
+        assert_eq!(sessions.available_permits(), MAX_SESSIONS - 1);
+        drop(tls);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sessions.available_permits() < MAX_SESSIONS {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the relay's session is never freed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_filter_sees_the_path_sent_upstream_not_the_raw_one() {
+        let filter = Arc::new(RecordingFilter::default());
+        let f = filtered_fixture(&filter, vec![OTHER_HOST.into()]).await;
+        let response = terminated_request(&f, "GET /public/%2e%2e/private/../admin HTTP/1.1").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(filter.seen.lock().unwrap()[0].2, "/admin");
+        assert_eq!(f.upstream.seen.lock().unwrap()[0].1, "/admin");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn websocket_upgrade_requests_get_http_fallback_without_leaking_credentials() {
         let f = fixture().await;
@@ -3104,6 +3424,21 @@ mod tests {
             f.upstream.seen.lock().unwrap().as_slice(),
             &[("Bearer real-secret".to_string(), "/v1/stream".to_string())]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_websocket_with_its_placeholder_in_the_url_gets_426_so_the_client_can_fall_back() {
+        let f = fixture().await;
+        // Clients that cannot set WebSocket headers put the token in the URL, and their HTTP fallback in a header.
+        let request = format!(
+            "GET /v1/stream?access_token={} HTTP/1.1\r\nHost: {CRED_HOST}\r\nConnection: Upgrade, close\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            f.placeholder
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 426"), "{response}");
+        assert!(f.upstream.seen.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
